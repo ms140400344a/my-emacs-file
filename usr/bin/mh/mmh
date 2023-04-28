@@ -1,0 +1,140 @@
+#!/bin/sh
+# 2011  markus schnalke <meillo@marmaro.de>
+#
+# replacement for install-mh(1)
+# set up mmh for the user
+#
+# Uses: folder(1)
+#
+# Todo: use chmod or set umask for created files?
+# Todo: install signal handlers and tell how to abort
+
+
+# the following constants must match the values in config/config.c
+mmhdir=.mmh
+profile=profile
+mailstore=Mail
+
+
+#
+# process args
+#
+while [ $# -ge 1 ] ; do
+	case $1 in
+	-c*)
+		# check if mmh is set up
+		# Note: The mail storage dir gets silently created if
+		#       everything else is properly set up.
+		folder -create >/dev/null 2>&1
+		exit $?
+		;;
+	-V*)
+		echo "mmh has no own version number, thus this instead:"
+		folder -Version
+		exit 0
+		;;
+	-h*|*)
+		echo "Usage: $0      -- set up mmh for you" >&2
+		echo "       $0 -c   -- check if mmh is set up for you" >&2
+		exit 1
+	esac
+	shift
+done
+
+
+cat <<!
+Welcome to mmh, meillo's MH version
+===================================
+This program does only one small, but important task: it sets up mmh for your
+user account. Afterwards you can access the functions of mmh by using any of
+the specialized tools from the mmh toolchest. The man page mmh(1) lists them.
+Consult the man pages of the individual programs for further documentation.
+
+But now, let's set up mmh for you ...
+
+!
+
+
+# fail early and loud
+set -e
+
+
+finish() {
+	cd "$mmhpath"
+	echo "Path: $mailstore" >"$profile"
+	echo 3.
+	folder
+	echo
+	echo "Enjoy ..."
+	exit 0
+}
+
+
+#
+# mmh dir
+#
+mmhdir="${MMH:=$mmhdir}"
+cd  # relative to HOME
+echo 1.
+if [ -d "$mmhdir" ] ; then
+	echo "--> Using existing mmh directory $mmhdir"
+else
+	mkdir "$mmhdir" && echo "--> Created mmh directory $mmhdir"
+fi
+cd "$mmhdir"
+mmhpath="`pwd`"
+
+
+#
+# profile
+#
+profile="${MMHP:=$profile}"  # relative to $mmhpath
+if [ -f "$profile" ] ; then
+	echo 2.
+	echo "You already have an mmh profile."
+	printf "Do you want to edit the file now? [Y/n]  "
+	read answ
+	case "$answ" in
+	''|Y*|y*)
+		cd "$mmhpath"
+		${VISUAL:-${EDITOR:-vi}} "$profile"
+		echo
+		echo "Enjoy ..."
+		exit 0
+		;;
+	*)
+		echo "Exiting."
+		exit 1
+		;;
+	esac
+fi
+
+
+#
+# mail store
+#
+echo 2.
+echo "Mmh needs a mail storage."
+cd  # relative to HOME
+if [ -d "$mailstore" ] ; then
+	echo "The suggested directory `pwd`/$mailstore already exists."
+	printf "Do you want to use it for mmh? [Y/n]  "
+	read answ
+	case "$answ" in
+	''|Y*|y*)
+		cd "$mailstore"
+		echo "--> Using existing directory $mailstore"
+		finish
+		exit
+		;;
+	esac
+fi
+printf "Where do you want it to be located? [`pwd`/Mail]  "
+read answ
+if [ -z "$answ" ] ; then
+	answ="`pwd`/Mail"
+fi
+mkdir "$answ" && echo "--> Created $answ"
+cd "$answ"
+mailstore="`pwd`"
+finish

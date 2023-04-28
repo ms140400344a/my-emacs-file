@@ -1,0 +1,294 @@
+#!/bin/sh
+
+printhelp()
+{
+	echo "Usage: $0 command"
+	echo "  commands are:"
+	echo "  edit [editor]"
+	echo "  list"
+	echo "  send [sendargs]"
+	echo "  delete"
+	echo "  display"
+	echo "  attach files"
+	echo "  alist"
+	echo "  detach anum"
+	echo "  refile +folder"
+	echo "  -help"
+	echo "  -Version"
+}
+
+version()
+{
+	if [ $1 -eq 0 ]
+	then
+		echo "$0 has no own version number, thus this instead:"
+		folder -Version
+		exit 0
+	fi
+	echo "$0 has no own version number, thus this instead:" 1>&2
+	folder -Version 1>&2
+	exit 1
+}
+
+usage()
+{
+	if [ $1 -eq 0 ]
+	then
+		printhelp
+		exit 0
+	fi
+	printhelp 1>&2
+	exit 1
+}
+
+get_editor()
+{
+	if [ -f "$mhmetafile" ]
+	then
+		lasteditor=`anno -list -component 'mmh-last-editor' "$mhmetafile"`
+		if [ -n "$lasteditor" ]
+		then
+			editor=`echo $lasteditor | cut -d ' ' -f 1`
+			mheditor=`mhparam "$editor-next"`
+			[ -n "$mheditor" ] && return
+			mheditor=$lasteditor
+			return
+		fi
+	fi
+	if [ -n "$MMHEDITOR" ]
+	then
+		mheditor=$MMHEDITOR
+		return
+	fi
+	mheditor=`mhparam 'Editor'`
+}
+
+save_config()
+{
+	component="$1"
+	newtext="$2"
+	anno -delete -number all -component "$component" "$mhmetafile"
+	anno -nodate -component "$component" -text "$newtext" "$mhmetafile"
+}
+
+get_showproc()
+{
+	mhshowproc=`mhparam 'listproc'`
+	return
+}
+
+get_realpath()
+{
+	reldir=`dirname "$1"`
+	filename=`basename "$1"`
+	cd "$reldir"
+	echo "$PWD/$filename"
+	cd "$OLDPWD"
+}
+
+create()
+{
+	if [ -z "$mhdraft" ]
+	then
+		usage 1
+	fi
+	mhext=`mhparam Metafile-Extension`
+	mhmetafile="$mhdraft""$mhext"
+	touch "$mhmetafile"
+	if [ -z "$mheditor" ]
+	then
+		get_editor
+	fi
+	if [ "$mhuse" -eq 1 ]
+	then
+		exec $mheditor $mhdraft
+		return
+	fi
+	save_config mmh-mhaltmsg "$mhaltmsg"
+	save_config mmh-mhdist "$mhdist"
+	save_config mmh-mhfolder "$mhfolder"
+	save_config mmh-mhmessages "$mhmessages"
+	save_config mmh-mhannotate "$mhannotate"
+	save_config mmh-last-editor "$mheditor"
+	exec $mheditor "$mhdraft"
+}
+
+edit()
+{
+	if [ $# -eq 0 ]
+	then
+		get_editor
+	else
+		mheditor="$@"
+	fi
+
+	save_config mmh-last-editor "$mheditor"
+	exec $mheditor "$mhdraft"
+}
+
+list()
+{
+	get_showproc
+	exec $mhshowproc -file $mhdraft
+}
+
+sendfunktion()
+{
+	export mhaltmsg=`anno -list -component 'mmh-mhaltmsg' "$mhmetafile"`
+	export mhdist=`anno -list -component 'mmh-mhdist' "$mhmetafile"`
+	export mhfolder=`anno -list -component 'mmh-mhfolder' "$mhmetafile"`
+	export mhmessages=`anno -list -component 'mmh-mhmessages' "$mhmetafile"`
+	export mhannotate=`anno -list -component 'mmh-mhannotate' "$mhmetafile"`
+	tmp=`mktemp`
+	cp "$mhdraft" "$tmp"
+	mhl -form mhl.whatnow2 "$tmp" > "$mhdraft"
+	mhle="$?"
+	if [ "$mhle" -ne 0 ]
+	then
+		mv "$tmp" "$mhdraft"
+		exit "$mhle"
+	fi
+	send "$@" "$mhdraft" || exit $?
+	rm -f "$mhmetafile"
+	rm -f "$tmp"
+	exit 0
+}
+
+delete()
+{
+	folder -push "$draftfolder" >/dev/null 2>&1
+	rmm "$draftfolder" c
+	folder -pop >/dev/null 2>&1
+	rm "$mhmetafile"
+}
+
+attach()
+{
+	header=`mhparam 'Attachment-Header'`
+	while [ -n "$1" ]
+	do
+		if [ ! -f "$1" ]
+		then
+			echo "file not found: $1" 1>&2
+			shift
+			echo -n "folloing files are not attached: " 1>&2
+			echo -n "$1" 1>&2
+			echo "$@" 1>&2
+			exit 1
+		fi
+		file=`get_realpath "$1"`
+		anno -nodate -append -component "$header" -text "$file" "$mhdraft"
+		shift
+	done
+}
+
+alist()
+{
+	header=`mhparam 'Attachment-Header'`
+	anno -list -number -component "$header" "$mhdraft"
+}
+
+detach()
+{
+	header=`mhparam 'Attachment-Header'`
+	while [ -n "$1" ]
+	do
+		anno -delete -component "$header" -number "$1" "$mhdraft"
+		if [ $? -ne 0 ]
+		then
+			echo "can't delet attachment $1" 1>&2
+			exit 1
+		fi
+		shift
+	done
+}
+
+display()
+{
+	mhaltmsg=`anno -list -component 'mmh-mhaltmsg' "$mhmetafile"`
+	get_showproc
+	if [ -z "$mhaltmsg" ]
+	then
+		echo "no altmsg" 1>&2
+		exit 1
+	fi
+	exec $mhshowproc -file "$mhaltmsg"
+}
+
+if [ $# -eq 0 ]
+then
+	create
+	exit
+fi
+
+command="$1"
+shift
+
+draftfolder=`mhparam draftfolder`
+
+mhdraft=`mhpath "$draftfolder" c 2>/dev/null`
+if [ -z "$mhdraft" ]
+then
+	case "$command" in
+	-h|-he|-hel|-help)
+		usage $#
+		;;
+	-V|-Ve|-Ver|-Vers|-Versi|-Versio|-Version)
+		version $#
+		;;
+	*)
+		echo "no current message in $draftfolder" 1>&2
+		usage 1
+		;;
+	esac
+fi
+mhext=`mhparam Metafile-Extension`
+mhmetafile="$mhdraft""$mhext"
+touch "$mhmetafile"
+
+
+case "$command" in
+e|ed|edi|edit)
+	edit "$@"
+	;;
+l|li|lis|list)
+	[ $# -eq 0 ] || usage 1
+	list
+	;;
+s|se|sen|send)
+	sendfunktion "$@"
+	;;
+del|dele|delet|delete)
+	[ $# -eq 0 ] || usage 1
+	delete
+	;;
+di|dis|disp|displ|displa|display)
+	[ $# -eq 0 ] || usage 1
+	display
+	;;
+at|att|atta|attac|attach)
+	attach "$@"
+	;;
+al|ali|alis|alist)
+	[ $# -eq 0 ] || usage 1
+	alist
+	;;
+det|deta|detac|detach)
+	detach "$@"
+	;;
+r|re|ref|refi|refil|refile)
+	refile -file "$mhdraft" "$@"
+	;;
+w|wh|who|whom)
+	whom "$@" "$mhdraft"
+	;;
+-h|-he|-hel|-help)
+	usage $#
+	;;
+-V|-Ve|-Ver|-Vers|-Versi|-Versio|-Version)
+	version $#
+	;;
+*)
+	usage 1
+	;;
+esac

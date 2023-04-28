@@ -1,0 +1,331 @@
+#!/bin/sh
+# Based on mhsign 1.1.0.9 2007/05/30 14:48:40 by Neil Rickert
+# Adjusted to mmh by markus schnalke <meillo@marmaro.de>, 2012-07
+
+
+# mhsign:
+#   -encrypt:  Encrypt to recipients of message. This implies signing.
+#   -mime:     Use MIME pgp standard.  For signature, trailing blanks
+#              will be removed and any "From " line will be indented for
+#              best compatibility. Enforced for multipart messages.
+
+usage="Usage: mhsign [-encrypt] [-mime] [-Version] [-help] file"
+
+# defaults
+usemime=n
+function=sign
+
+
+# find out the signing key
+userid="$MMHPGPKEY"
+if [ -z "$userid" ] ; then
+	userid="`mhparam pgpkey`"
+fi
+if [ -z "$userid" ] ; then
+	userid="`gpg --list-secret-keys --with-colons --fixed-list-mode \
+				2>/dev/null |
+			grep '^sec' | sort -t: -k3,3nr -k 6,6nr |
+			awk -F: '
+				$7=="" || $7 > "'"\`date +%s\`"'" {
+					print $5; exit;
+				}
+			'`"
+fi
+if [ -z "$userid" ] ; then
+	echo "No secret key found" >&2
+	exit 1
+fi
+
+# find out the file of recipient key exceptions (for encrypt only)
+keyfile="${MMH:-$HOME/.mmh}/pgpkeys"
+if [ ! -r "$keyfile" ] ; then
+	keyfile="${GNUPGHOME:-$HOME/.gnupg}/pgpkeys"
+	if [ ! -r "$keyfile" ] ; then
+		keyfile=/dev/null
+	fi
+fi
+
+# prepend the default options from the profile
+set -- `mhparam -nocomp ${0##*/}` "$@"
+
+while : ; do
+	case "$1" in
+	-e*)
+		function=encrypt
+		;;
+	-m*)
+		usemime=y
+		;;
+	-V*)
+		echo "mhsign has no own version number, thus this instead:"
+		folder -Version
+		exit 0
+		;;
+	-h*|-*)
+		echo "$usage" >&2
+		exit 1
+		;;
+	*)
+		break
+	esac
+	shift
+done
+
+if [ $# -ne 1 ] ; then
+	echo "$usage" >&2
+	exit 1
+fi
+
+TEMP=/tmp/${0##*/}.$$
+umask 077
+mkdir $TEMP || exit 1
+trap "rm -rf $TEMP" 0 1 2 15
+
+### lookupkeyfile address -- lookup one address in our database
+lookupkeyfile() {
+	key=`grep -i "^[^#].*[ 	]$1\$" "$keyfile" 2>/dev/null`
+	if [ $? != 0 ] ; then
+		return 1
+	fi
+	echo "$key" | sed 's/[ 	].*//;q'
+	return 0
+}
+
+### lookupkeyring address -- lookup one address in keyring
+lookupkeyring() {
+	key=`gpg --list-keys --with-colons "<$1>" 2>/dev/null`
+	if [ $? != 0 ] ; then
+		return 1
+	fi
+	echo "$key" | sed -n '/^pub:[^idre]:/{p;q;}' | cut -d: -f5
+	return 0
+}
+
+### Do a best guess at FQDN
+mh_hostname()
+{
+	hostname -f 2>/dev/null || uname -n
+}
+
+### lookupkeys file -- set $KL to list of recipient keys
+lookupkeys() {
+	KL=
+	status=0
+	if whom -ali -notocc -bcc "$1" >/dev/null ; then
+		echo "Encryption is not supported for BCCs" >&2
+		return 1
+	fi
+
+	# extract the actual address
+	format='%<{error}%{error}: %{text}%|%(addr{text})%>'
+	addresses=`whom -ali -tocc -nobcc "$1" |sed 's_$_,_'`
+	addresses=`/usr/lib/mmh/ap -form "=$format" "$addresses"`
+
+	for i in $addresses ; do
+		case "$i" in
+		'|'*)	echo "Ignoring pipe address" >&2
+			continue ;;
+		*@*)	;;
+		*)	i="$i@`mh_hostname`" ;;
+		esac
+		if k=`lookupkeyfile "$i"` ; then
+			KL="$KL $k"
+		elif k=`lookupkeyring "$i"` ; then
+			KL="$KL $k"
+		else
+			echo "Could not find key for <$i>" >&2
+			status=1
+		fi
+	done
+	return $status
+}
+
+### getheader headername msgfile
+getheader() {
+	HDR=`sed -n -e '/^-*$/q' -e 's/^\([^ 	:]*\):.*/\1/p' $2 |
+		grep -i '^'"$1"'$' | head -1`
+	if [ "$HDR" = "" ] ; then return 1 ; fi
+	sed -n -e ':a
+		/^-*$/q
+		/^'"$HDR"':/b x
+		d
+		b a
+		:x
+		p
+		n
+		/^[ 	]/b x
+		b a' $2
+		return 0
+}
+
+### headbody msgfile # separate msgfile into $TEMP/head $TEMP/body
+headbody() {
+	sed -n '1,/^\-*$/p' "$1" > $TEMP/head
+	sed '1,/^-*$/d' "$1" > $TEMP/body
+}
+
+### fixheaders -- remove Content headers, add newheaders
+fixheaders() {
+	sed -n ':a
+		/^-*$/q
+		/^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-/b r
+		p
+		n
+		b a
+		:r
+		n
+		/^[ 	]/b r
+		b a' $TEMP/head
+	cat $TEMP/newheaders
+	grep "^-" $TEMP/head || echo ""
+}
+
+### newboundary -- output a suitable boundary marker
+newboundary() {
+	b=$$_`LC_ALL=C date|sed 's/[ :	]/_/g'`
+	for i in 0 x '=' _ + , Z 9 4 ; do
+		if grep "^--$b" $TEMP/body >/dev/null 2>&1 ; then
+			## oops, bad boundary -- try again
+			b=`echo $i$b | tr \
+'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456780=+,_' \
+'3Ba+c98bdACmzXpqR,tTuMDSs_hLkwZ0ef7PQrW=2x5l6E14ZKivIVgOjoJnGNUyHF'`
+		else
+			echo "$b"
+			return 0
+		fi
+	done
+	echo "Failed to generate unique mime boundary" >&2
+	exit 1
+}
+
+### detachsign -- sign $TEMP/body, output in $TEMP/body.asc
+detachsign() {
+	gpg -u "$userid" --armor --textmode --detach-sign \
+			<$TEMP/body >$TEMP/body.asc
+}
+
+### sign --- inline signature for $TEMP/body, output in $TEMP/body.asc
+sign() {
+	gpg -u "$userid" --armor --textmode --clearsign \
+		<$TEMP/body >$TEMP/body.asc
+}
+
+### encrypt recipients -- encrypt $TEMP/body to recipients
+encrypt() {
+	R=
+	for i in $KL ; do
+		R="$R -r $i"
+	done
+	gpg --no-encrypt-to -u "$userid" --armor --textmode \
+			--always-trust --output $TEMP/body.asc \
+			-r "$userid" $R --sign --encrypt $TEMP/body
+}
+
+### Mainline processing
+
+FILE="$1"	## we assume a disk file
+if [ ! -r "$FILE" ] ; then
+	echo "cannot read $FILE" >&2
+	exit 1
+fi
+
+case "$function" in
+encrypt)
+	lookupkeys "$FILE" || exit 1
+esac
+
+cp "$FILE" "$FILE.orig"
+outfile="$FILE"
+headbody "$FILE"
+
+CT=""
+if grep -i "^mime-version:" $TEMP/head >/dev/null 2>&1 ; then
+	>$TEMP/newheaders
+	if CT=`getheader content-type $TEMP/head` ; then
+		echo "$CT" >$TEMP/newbody
+		if grep -i multipart $TEMP/newbody >/dev/null 2>&1 ; then
+			usemime=y  # Force MIME if already multi-part
+		fi
+		getheader content-transfer-encoding $TEMP/head \
+				>>$TEMP/newbody || :
+	else
+		CT=""
+	fi
+else
+	echo "Mime-Version: 1.0" >$TEMP/newheaders
+fi
+
+if [ "$usemime" = n ] ; then
+	### non-MIME ###
+	case "$function" in
+	sign)
+		sign || exit 1 ;;
+	encrypt)
+		encrypt || exit 1 ;;
+	esac
+	cat $TEMP/head $TEMP/body.asc >$outfile || exit 1
+	exit 0
+fi
+
+### MIME ###
+
+BDRY="`newboundary`"
+
+if [ "$CT" = "" ] ; then
+	echo "Content-Type: text/plain; charset=us-ascii" >$TEMP/newbody
+fi
+echo >>$TEMP/newbody
+
+case $function in
+sign)
+	sed 's/^From / &/; s/[ 	]*$//' $TEMP/body >>$TEMP/newbody
+	if grep "^From " $TEMP/body >/dev/null 2>&1 ; then
+		echo 'Warning: "From " lines in message body have been indented' >&2
+	fi
+	if grep "[ 	]$" $TEMP/body >/dev/null 2>&1 ; then
+		echo 'Warning: trailing blanks removed from message body' >&2
+	fi
+	echo 'Content-Type: multipart/signed; protocol="application/pgp-signature";' >>$TEMP/newheaders
+	echo "	micalg=pgp-sha1"'; boundary="'"$BDRY"'"' >>$TEMP/newheaders
+
+	sed -e 's/$//' "$TEMP/newbody" >"$TEMP/body"
+	detachsign || exit 1
+	(
+		echo "--$BDRY"
+		cat $TEMP/newbody
+		echo
+		echo "--$BDRY"
+		echo "Content-Type: application/pgp-signature"
+		echo
+		cat $TEMP/body.asc
+		echo
+		echo "--$BDRY--"
+		echo
+	) >$TEMP/body
+	;;
+
+encrypt)
+	cat $TEMP/body >>$TEMP/newbody
+	echo 'Content-Type: multipart/encrypted; protocol="application/pgp-encrypted";' >>$TEMP/newheaders
+	echo "	boundary=\"$BDRY\"" >> $TEMP/newheaders
+
+	mv $TEMP/newbody $TEMP/body || exit 1
+	encrypt || exit 1
+	(
+		echo "--$BDRY"
+		echo "Content-Type: application/pgp-encrypted"
+		echo
+		echo "Version: 1"
+		echo
+		echo "--$BDRY"
+		echo "Content-Type: application/octet-stream"
+		echo
+		cat $TEMP/body.asc
+		echo
+		echo "--$BDRY--"
+		echo
+	) >"$TEMP/body"
+	;;
+esac
+
+fixheaders | cat - $TEMP/body >"$outfile"

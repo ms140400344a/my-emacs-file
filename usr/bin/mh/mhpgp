@@ -1,0 +1,187 @@
+#!/bin/sh
+# Based on mhpgp 1.1.0.7 2005/11/29 06:25:05 by Neil Rickert
+# Adjusted to mmh by markus schnalke <meillo@marmaro.de>, 2012-07
+
+
+# mhpgp:
+#   -write:  Save the decrypted message to the current folder
+
+usage="Usage: mhpgp [-write] [-Version] [-help] [+folder] [msg]"
+
+# prepend the default options from the profile
+set -- `mhparam -nocomp ${0##*/}` "$@"
+
+while : ; do
+        case "$1" in
+	-w*)
+		wflag=1
+		;;
+	-V*)
+		echo "${0##*/} has no own version number, thus this instead:"
+		folder -Version
+		exit 0
+		;;
+	-h*|-*)
+		echo "$usage" >&2
+		exit 1
+		;;
+	*)
+		break
+		;;
+	esac
+	shift
+done
+
+TEMP=/tmp/${0##*/}.$$
+umask 077
+mkdir $TEMP || exit 1
+trap "rm -rf $TEMP" 0 1 2 15
+
+
+### verify a mime message
+mimeverify() {
+	bdry=`echo "$CH" | sed -n \
+			-e 's/[Bb][Oo][Uu][Nn][Dd][Aa][Rr][Yy]=/;boundary=/' \
+			-e 's/.*;boundary=/boundary=/' \
+			-e 's/^boundary=\([^;]*\);.*/boundary=\1/' \
+			-e 's/^boundary="\([^"]*\)".*/boundary=\1/' \
+			-e 's/[ 	][ 	]*$//' \
+			-e 's/^boundary=//p'`
+
+	xbdry=`echo "$bdry" | sed -e 's"/"\\\\/"g' -e 's"\."\\\\."g'`
+
+	sed -e '1,/^--'"$xbdry"'[ 	]*$/d' $FILE > $TEMP/body
+
+	sed -e '/^--'"$xbdry"'[ 	]*$/,$d' \
+			-e 's/[ 	][ 	]*$//' $TEMP/body |
+			sed -e '$d' -e 's/$//' > $TEMP/msg
+	if grep "[ ^M   ]$" $TEMP/body >/dev/null 2>&1 ; then
+		echo 'Warning: trailing blanks removed from message body' >&2
+	fi
+
+	sed -e '1,/^--'"$xbdry"'[ 	]*$/d' $TEMP/body |
+		sed -n -e '/BEGIN PGP /,/END PGP /p' > $TEMP/msg.asc
+
+	gpg --verify $TEMP/msg.asc
+}
+
+### decrypt MIME and non-MIME messages (type is in $1)
+###; invoke the pager as needed
+decrypt() {
+	sed -n -e '
+		/^-----BEGIN PGP MESSAGE/b x
+		d
+		:x
+		p
+		/^-----END PGP MESSAGE/b y
+		n
+		b x
+		:y
+		n
+		b y' $FILE | gpg --decrypt >$TEMP/msg
+	X=`tail -1c $TEMP/msg`
+	if [ "$X" != "" ] ; then
+		# ensure trailing newline
+		echo >> $TEMP/msg
+	fi
+	if [ "$1" = "plain" ] ; then
+		sedcmd="/^[Mm][Ii][Mm][Ee]-.*:/b r"
+	else
+		sedcmd='/^-*$/q'
+	fi
+
+	sed -n ':a
+		/^-*$/q
+		'"$sedcmd"'
+		/^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-/b r
+		p
+		n
+		b a
+		:r
+		n
+		/^[ 	]/b r
+		b a' "$FILE" > "$TEMP/outfile"
+
+	if [ "$1" = "plain" ] ; then echo "" >> "$TEMP/outfile" ; fi
+
+	# Replace original header fields by secure copies that some
+	# mail clients (e.g. Enigmail) store within the encrypted and
+	# signed MIME part.
+	for i in `sed -n '/^$/q; /^[ 	]/d; s,:.*,,p' "$TEMP/msg"` ; do
+		anno -delete -comp "$i" "$TEMP/outfile"
+	done
+
+	sed -e 's/$//' $TEMP/msg >> "$TEMP/outfile" || exit 1
+
+	if [ "$wflag" = "1" ] ; then
+		refile -file "$TEMP/outfile" @
+	else
+		show -file "$TEMP/outfile"
+	fi
+}
+
+
+### Mainline processing
+
+case "$#" in
+0)
+	FILE=`mhpath c` || exit 1 ;;
+*)
+	case "$*" in
+	/*)	FILE=`echo "$@"` ;;
+	*)	FILE=`mhpath "$@"` || exit 1 ;;
+	esac ;;
+esac
+
+set X $FILE
+
+if [ $# != 2 ] ; then
+	echo "One message at a time, please!" >&2
+	exit 1
+fi
+
+# get mime-version and content-type headers.
+CH=`sed -n -e '\
+	:a
+	/^-*$/q
+	/^[Mm][Ii][Mm][Ee]-[Vv][Ee][Rr][Ss][Ii][Oo][Nn]:/b x
+	/^[Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Tt][Yy][Pp][Ee]:/b x
+	d
+	:x
+	p
+	n
+	/^[ 	]/b x
+	b a' $FILE`
+
+if echo "$CH" | grep -i mime-version >/dev/null 2>&1; then
+	:	## nothing, this is good
+else
+	CH=
+fi
+
+# Handle MIME variants
+case "$CH" in
+*application/pgp-signature*)
+	mimeverify
+	exit
+	;;
+*application/pgp-encrypted*)
+	decrypt mime
+	exit
+	;;
+esac
+
+# Handle plain variants
+case "`grep '^-----BEGIN PGP' $FILE 2>/dev/null`" in
+*"PGP SIGNED MESSAGE"*)
+	gpg --verify "$FILE"
+	exit
+	;;
+*"BEGIN PGP MESSAGE"*)
+	decrypt plain
+	exit
+	;;
+esac
+
+echo "I can't find a PGP message there" >&2
+exit 1
